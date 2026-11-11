@@ -1,11 +1,12 @@
 """
-WEEX MASTER AUTONOMOUS BOT: 3 ESTRATEGIAS + MULTI-TIMEFRAME + PnL NETO CON COMISIONES
-- 3 Estrategias seleccionables: Agresiva, Moderada y Conservadora.
-- Multi-Temporalidad: Confirma tendencia en 15m y entrada precisa en 1m/5m.
-- PnL Neto Real: Descuenta automáticamente las comisiones del exchange en cada cálculo.
-- Cooldown tras Stop Loss: Evita recomprar un activo en caída por 5 minutos.
-- Control total desde Telegram con comandos interactivos (/estrategia, /pnl, /posiciones).
-- Servidor keep_alive para Render 24/7 sin suspensión.
+WEEX MASTER AUTONOMOUS BOT CON MENÚ DE BOTONES INTERACTIVOS EN TELEGRAM
+- Teclado táctil permanente (ReplyKeyboard): Posiciones, PnL Neto, Estrategias, Balance, Auto-Trading, Estado.
+- Botones en línea (InlineButtons) para cambiar de estrategia con 1 solo toque.
+- 3 Estrategias: Agresiva, Moderada y Conservadora.
+- Multi-Temporalidad: Tendencia 15m + Gatillo 1m.
+- PnL Neto Real con comisiones descontadas en todo momento.
+- Cooldown tras Stop Loss (5 minutos de protección).
+- Servidor keep_alive integrado para Render.
 """
 
 import os
@@ -17,8 +18,15 @@ from pathlib import Path
 import ccxt
 import pandas as pd
 from dotenv import load_dotenv
-from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
+from telegram import Update, ReplyKeyboardMarkup, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    ApplicationBuilder, 
+    CommandHandler, 
+    MessageHandler, 
+    CallbackQueryHandler, 
+    filters, 
+    ContextTypes
+)
 from keep_alive import start_keep_alive
 
 load_dotenv()
@@ -41,37 +49,47 @@ MARKET_TYPE = os.getenv("MARKET_TYPE", "spot")
 # Temporalidades
 TIMEFRAME_MACRO = os.getenv("TIMEFRAME", "15m")       # Tendencia general
 TIMEFRAME_MICRO = os.getenv("ENTRY_TIMEFRAME", "1m")   # Gatillo de entrada precisa
-INTERVAL = max(20, int(os.getenv("CHECK_INTERVAL_SEC", "35"))) # Escaneo cada 35s
+INTERVAL = max(20, int(os.getenv("CHECK_INTERVAL_SEC", "35")))
 AMOUNT_USDT = float(os.getenv("TRADE_AMOUNT_USDT", "10"))
 
 # Comisión del exchange estimada por operación (0.2% por lado)
 FEE_PCT = float(os.getenv("FEE_PCT", "0.002")) 
 
-# Cooldown tras Stop Loss (en segundos)
+# Cooldown tras Stop Loss
 COOLDOWN_SL_SEC = int(os.getenv("COOLDOWN_AFTER_SL_SEC", "300"))
 cooldown_tracker = {} # symbol -> timestamp
 
-# ==================== 3 ESTRATEGIAS DE TRADING ====================
+# ==================== MENÚ DE BOTONES INTERACTIVOS ====================
+MAIN_KEYBOARD = ReplyKeyboardMarkup(
+    [
+        ["📊 Posiciones", "💰 PnL Neto"],
+        ["⚙️ Estrategias", "💼 Balance"],
+        ["🤖 Auto-Trading", "ℹ️ Estado"]
+    ],
+    resize_keyboard=True,
+    is_persistent=True
+)
+
 STRATEGIES = {
     "conservadora": {
         "name": "🛡️ Conservadora",
-        "tp_pct": 3.0,     # +3.0% para superar holgadamente las comisiones
-        "sl_pct": 1.2,     # -1.2% corte rápido de pérdidas
-        "min_score": 78,   # Muy exigente
-        "desc": "Alta selectividad. Pocas operaciones pero de alta probabilidad.",
+        "tp_pct": 3.0,
+        "sl_pct": 1.2,
+        "min_score": 78,
+        "desc": "Alta selectividad. Operaciones muy seguras y ganancia amplia.",
     },
     "moderada": {
         "name": "⚖️ Moderada",
-        "tp_pct": 2.4,     # +2.4% ganancia sólida neta
-        "sl_pct": 1.5,     # -1.5%
-        "min_score": 70,   # Equilibrada
+        "tp_pct": 2.4,
+        "sl_pct": 1.5,
+        "min_score": 70,
         "desc": "Equilibrio ideal entre frecuencia y protección de capital.",
     },
     "agresiva": {
         "name": "⚡ Agresiva",
-        "tp_pct": 2.0,     # +2.0% scalping rápido
-        "sl_pct": 1.4,     # -1.4%
-        "min_score": 62,   # Mayor frecuencia
+        "tp_pct": 2.0,
+        "sl_pct": 1.4,
+        "min_score": 62,
         "desc": "Scalping activo con mayor cantidad de entradas.",
     }
 }
@@ -195,7 +213,7 @@ def get_pnl_summary():
         "winrate": winrate
     }
 
-# ==================== TELEGRAM GUARD & EXCHANGE ====================
+# ==================== SEGURIDAD & CONEXIÓN ====================
 def authorized(update: Update) -> bool:
     if not CHAT_ID:
         return True
@@ -223,7 +241,6 @@ def rsi(series: pd.Series, period: int = 14) -> pd.Series:
 
 # ==================== ANÁLISIS MULTI-TEMPORALIDAD ====================
 def analyze_multi_timeframe(symbol: str) -> dict:
-    # 1. Macro (15m): Tendencia General
     candles_macro = exchange.fetch_ohlcv(symbol, timeframe=TIMEFRAME_MACRO, limit=60)
     if not candles_macro or len(candles_macro) < 25:
         raise ValueError("Historial macro insuficiente")
@@ -233,7 +250,6 @@ def analyze_multi_timeframe(symbol: str) -> dict:
     ema21_m = c_m.ewm(span=21, adjust=False).mean().iloc[-1]
     tendencia_alcista = ema9_m > ema21_m
 
-    # 2. Micro (1m): Gatillo de Entrada
     candles_micro = exchange.fetch_ohlcv(symbol, timeframe=TIMEFRAME_MICRO, limit=60)
     if not candles_micro or len(candles_micro) < 25:
         raise ValueError("Historial micro insuficiente")
@@ -311,7 +327,6 @@ async def master_trading_engine(context: ContextTypes.DEFAULT_TYPE):
 
     now_ts = datetime.now().timestamp()
 
-    # 1. MONITOREO DE POSICIONES ABIERTAS (CIERRES EN TP O SL)
     open_positions = get_open_positions()
     for pos in open_positions:
         sym = pos["symbol"]
@@ -324,7 +339,7 @@ async def master_trading_engine(context: ContextTypes.DEFAULT_TYPE):
         try:
             ticker = exchange.fetch_ticker(sym)
             curr_price = float(ticker["last"])
-        except Exception as e:
+        except Exception:
             continue
 
         pnl_bruto_pct = ((curr_price - entry_price) / entry_price) * 100
@@ -334,7 +349,7 @@ async def master_trading_engine(context: ContextTypes.DEFAULT_TYPE):
         pnl_neto_usdt = pnl_bruto_usdt - comision_estimada
         pnl_neto_pct = pnl_bruto_pct - (FEE_PCT * 200)
 
-        # A) Take Profit Alcanzado (GANANCIA NETA)
+        # Take Profit
         if curr_price >= tp_price:
             order_res = execute_order(sym, "sell", amount_coin, f"TP Alcanzado (+{pnl_neto_pct:.2f}% neto)")
             record_closed_trade(pos, curr_price, pnl_bruto_usdt, comision_estimada, pnl_neto_usdt, pnl_neto_pct, "TAKE_PROFIT")
@@ -353,11 +368,11 @@ async def master_trading_engine(context: ContextTypes.DEFAULT_TYPE):
             )
             if CHAT_ID:
                 try:
-                    await context.bot.send_message(chat_id=int(CHAT_ID), text=msg, parse_mode="Markdown")
+                    await context.bot.send_message(chat_id=int(CHAT_ID), text=msg, parse_mode="Markdown", reply_markup=MAIN_KEYBOARD)
                 except Exception:
                     pass
 
-        # B) Stop Loss Alcanzado (PROTECCIÓN)
+        # Stop Loss
         elif curr_price <= sl_price:
             order_res = execute_order(sym, "sell", amount_coin, f"SL Ejecutado ({pnl_neto_pct:.2f}% neto)")
             record_closed_trade(pos, curr_price, pnl_bruto_usdt, comision_estimada, pnl_neto_usdt, pnl_neto_pct, "STOP_LOSS")
@@ -376,11 +391,11 @@ async def master_trading_engine(context: ContextTypes.DEFAULT_TYPE):
             )
             if CHAT_ID:
                 try:
-                    await context.bot.send_message(chat_id=int(CHAT_ID), text=msg, parse_mode="Markdown")
+                    await context.bot.send_message(chat_id=int(CHAT_ID), text=msg, parse_mode="Markdown", reply_markup=MAIN_KEYBOARD)
                 except Exception:
                     pass
 
-    # 2. BÚSQUEDA Y APERTURA DE NUEVAS OPERACIONES
+    # Nuevas compras
     if not AUTOTRADE_ENABLED:
         return
 
@@ -426,30 +441,28 @@ async def master_trading_engine(context: ContextTypes.DEFAULT_TYPE):
                     )
                     if CHAT_ID:
                         try:
-                            await context.bot.send_message(chat_id=int(CHAT_ID), text=msg, parse_mode="Markdown")
+                            await context.bot.send_message(chat_id=int(CHAT_ID), text=msg, parse_mode="Markdown", reply_markup=MAIN_KEYBOARD)
                         except Exception:
                             pass
         except Exception as e:
             log.warning("Escaneo de %s: %s", sym, e)
 
-# ==================== COMANDOS TELEGRAM ====================
+# ==================== COMANDOS TELEGRAM & BOTONES ====================
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await guard(update): return
     strat = STRATEGIES[ACTIVE_STRATEGY]
     msg = (
-        "🤖 *WEEX MASTER BOT (MULTI-ESTRATEGIA & PnL NETO)*\n\n"
+        "🤖 *PANEL DE CONTROL - WEEX TRADING BOT*\n\n"
         f"Estrategia actual: *{strat['name']}*\n\n"
-        "Comandos principales:\n"
-        "• `/estrategia` - Ver o cambiar estrategia (`agresiva`, `moderada`, `conservadora`)\n"
-        "• `/pnl` - Ganancias netas en USDT (con comisiones descontadas)\n"
-        "• `/posiciones` - Operaciones abiertas y ganancia flotante en vivo\n"
-        "• `/cerrar BTC/USDT` - Cerrar una posición a mercado\n"
-        "• `/autotrade on|off` - Activar o pausar el auto-trading\n"
-        "• `/balance` - Saldo libre en WEEX\n"
-        "• `/estado` - Configuración general y estado del bot\n"
-        "• `/precio BTC/USDT` - Precio actual\n"
+        "👇 *Toca los botones del menú de abajo para consultar al instante:*\n"
+        "• *📊 Posiciones*: Ver operaciones en curso y ganancia en vivo\n"
+        "• *💰 PnL Neto*: Informe financiero con comisiones descontadas\n"
+        "• *⚙️ Estrategias*: Cambiar perfil de riesgo con 1 toque\n"
+        "• *💼 Balance*: Saldo disponible en tu cuenta WEEX\n"
+        "• *🤖 Auto-Trading*: Activar o pausar las compras automáticas\n"
+        "• *ℹ️ Estado*: Configuración completa del sistema"
     )
-    await update.effective_message.reply_text(msg, parse_mode="Markdown")
+    await update.effective_message.reply_text(msg, parse_mode="Markdown", reply_markup=MAIN_KEYBOARD)
 
 async def cmd_estrategia(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await guard(update): return
@@ -465,15 +478,54 @@ async def cmd_estrategia(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"• Stop Loss: `-{s['sl_pct']}%`\n"
                 f"• Score Mínimo: `{s['min_score']}/100`\n"
                 f"• {s['desc']}",
-                parse_mode="Markdown"
+                parse_mode="Markdown",
+                reply_markup=MAIN_KEYBOARD
             )
             return
 
-    lines = ["📊 *ESTRATEGIAS DISPONIBLES:*\n"]
-    for k, v in STRATEGIES.items():
-        actual = "👉 *(ACTUAL)* " if k == ACTIVE_STRATEGY else "• "
-        lines.append(f"{actual}*{v['name']}* (`/estrategia {k}`)\n  TP: `+{v['tp_pct']}%` | SL: `-{v['sl_pct']}%` | Score: `≥{v['min_score']}`\n  _{v['desc']}_\n")
-    await update.effective_message.reply_text("\n".join(lines), parse_mode="Markdown")
+    inline_keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("🛡️ Conservadora (+3.0%)", callback_data="strat_conservadora"),
+        ],
+        [
+            InlineKeyboardButton("⚖️ Moderada (+2.4%)", callback_data="strat_moderada"),
+        ],
+        [
+            InlineKeyboardButton("⚡ Agresiva (+2.0%)", callback_data="strat_agresiva"),
+        ]
+    ])
+
+    lines = [f"⚙️ *SELECCIÓN DE ESTRATEGIA*\nEstrategia activa: *{STRATEGIES[ACTIVE_STRATEGY]['name']}*\n\n_Haz clic en un botón para cambiarla:_"]
+    await update.effective_message.reply_text("\n".join(lines), parse_mode="Markdown", reply_markup=inline_keyboard)
+
+async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Maneja los clics de botones en línea (InlineButtons)"""
+    if not await guard(update): return
+    query = update.callback_query
+    await query.answer()
+
+    global ACTIVE_STRATEGY, AUTOTRADE_ENABLED
+    data = query.data
+
+    if data.startswith("strat_"):
+        new_strat = data.replace("strat_", "")
+        if new_strat in STRATEGIES:
+            ACTIVE_STRATEGY = new_strat
+            s = STRATEGIES[ACTIVE_STRATEGY]
+            await query.edit_message_text(
+                f"✅ *Estrategia cambiada con éxito a:*\n*{s['name']}*\n\n"
+                f"• Take Profit: `+{s['tp_pct']}%` (Neto tras comisiones)\n"
+                f"• Stop Loss: `-{s['sl_pct']}%`\n"
+                f"• Filtro Score: `≥ {s['min_score']}/100`\n"
+                f"• _{s['desc']}_",
+                parse_mode="Markdown"
+            )
+    elif data == "toggle_autotrade_on":
+        AUTOTRADE_ENABLED = True
+        await query.edit_message_text("✅ *Auto-Trading ACTIVADO*. Buscando oportunidades...", parse_mode="Markdown")
+    elif data == "toggle_autotrade_off":
+        AUTOTRADE_ENABLED = False
+        await query.edit_message_text("⏸️ *Auto-Trading PAUSADO*. No se abrirán nuevas compras.", parse_mode="Markdown")
 
 async def cmd_pnl(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await guard(update): return
@@ -502,13 +554,13 @@ async def cmd_pnl(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"• Total Operaciones: *{summary['total']}*\n\n"
         "_Todas las ganancias reportadas son 100% netas con comisiones descontadas._"
     )
-    await update.effective_message.reply_text(msg, parse_mode="Markdown")
+    await update.effective_message.reply_text(msg, parse_mode="Markdown", reply_markup=MAIN_KEYBOARD)
 
 async def cmd_posiciones(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await guard(update): return
     positions = get_open_positions()
     if not positions:
-        await update.effective_message.reply_text("ℹ️ No hay posiciones abiertas actualmente. Escaneando oportunidades...")
+        await update.effective_message.reply_text("ℹ️ No hay posiciones abiertas actualmente. Escaneando oportunidades...", reply_markup=MAIN_KEYBOARD)
         return
 
     lines = ["📊 *POSICIONES ABIERTAS (PnL NETO EN VIVO):*\n"]
@@ -537,18 +589,78 @@ async def cmd_posiciones(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             lines.append(f"• *{sym}*: Entrada `${entry:g}`")
 
-    await update.effective_message.reply_text("\n".join(lines), parse_mode="Markdown")
+    await update.effective_message.reply_text("\n".join(lines), parse_mode="Markdown", reply_markup=MAIN_KEYBOARD)
+
+async def cmd_autotrade(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await guard(update): return
+    global AUTOTRADE_ENABLED
+    if context.args:
+        arg = context.args[0].lower()
+        if arg == "on":
+            AUTOTRADE_ENABLED = True
+            await update.effective_message.reply_text("✅ *Auto-Trading ACTIVADO*.", parse_mode="Markdown", reply_markup=MAIN_KEYBOARD)
+            return
+        elif arg == "off":
+            AUTOTRADE_ENABLED = False
+            await update.effective_message.reply_text("⏸️ *Auto-Trading PAUSADO*.", parse_mode="Markdown", reply_markup=MAIN_KEYBOARD)
+            return
+
+    status_txt = "ACTIVADO ✅" if AUTOTRADE_ENABLED else "PAUSADO ⏸️"
+    inline_btn = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("✅ Activar Auto-Trading", callback_data="toggle_autotrade_on"),
+            InlineKeyboardButton("⏸️ Pausar Auto-Trading", callback_data="toggle_autotrade_off")
+        ]
+    ])
+    await update.effective_message.reply_text(
+        f"🤖 *CONTROL DE AUTO-TRADING*\nEstado actual: *{status_txt}*\n\nToca una opción:",
+        parse_mode="Markdown",
+        reply_markup=inline_btn
+    )
+
+async def cmd_balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await guard(update): return
+    try:
+        bal = exchange.fetch_balance()
+        rows = [f"• *{c}*: `{v}`" for c, v in bal.get("total", {}).items() if v and v > 0.0001]
+        await update.effective_message.reply_text(
+            "💼 *Balance en WEEX:*\n" + ("\n".join(rows) if rows else "Sin fondos detectados."),
+            parse_mode="Markdown",
+            reply_markup=MAIN_KEYBOARD
+        )
+    except Exception as exc:
+        await update.effective_message.reply_text(f"Error consultando balance: {exc}", reply_markup=MAIN_KEYBOARD)
+
+async def cmd_estado(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await guard(update): return
+    open_count = len(get_open_positions())
+    is_live = (not DRY_RUN) and ALLOW_LIVE
+    s = STRATEGIES[ACTIVE_STRATEGY]
+    await update.effective_message.reply_text(
+        f"⚙️ *ESTADO DEL MASTER BOT*\n\n"
+        f"• Estrategia Activa: *{s['name']}*\n"
+        f"• Take Profit: `+{s['tp_pct']}%` | Stop Loss: `-{s['sl_pct']}%`\n"
+        f"• Auto-Trading: *{'ACTIVADO ✅' if AUTOTRADE_ENABLED else 'PAUSADO ⏸️'}*\n"
+        f"• Modo Órdenes: *{'🔴 DINERO REAL' if is_live else '🧪 SIMULACIÓN (DRY_RUN)'}*\n"
+        f"• Posiciones abiertas: *{open_count}/{MAX_OPEN_POSITIONS}*\n"
+        f"• Monto por trade: *{AMOUNT_USDT} USDT*\n"
+        f"• Comisión estimada considerada: `{(FEE_PCT*100):.2f}% por lado`\n"
+        f"• Watchlist: `{', '.join(WATCHLIST)}`\n"
+        f"• Temporalidades: Macro `{TIMEFRAME_MACRO}` + Micro `{TIMEFRAME_MICRO}`",
+        parse_mode="Markdown",
+        reply_markup=MAIN_KEYBOARD
+    )
 
 async def cmd_cerrar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await guard(update): return
     if not context.args:
-        await update.effective_message.reply_text("Uso: `/cerrar BTC/USDT`", parse_mode="Markdown")
+        await update.effective_message.reply_text("Uso: `/cerrar BTC/USDT`", parse_mode="Markdown", reply_markup=MAIN_KEYBOARD)
         return
 
     sym = context.args[0].upper()
     positions = [p for p in get_open_positions() if p["symbol"] == sym]
     if not positions:
-        await update.effective_message.reply_text(f"No hay posiciones abiertas para {sym}.")
+        await update.effective_message.reply_text(f"No hay posiciones abiertas para {sym}.", reply_markup=MAIN_KEYBOARD)
         return
 
     pos = positions[0]
@@ -570,68 +682,29 @@ async def cmd_cerrar(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"✅ Posición {sym} cerrada a mercado.\n"
             f"Salida: `${curr:g}` | PnL Neto: *{pnl_neto_pct:+.2f}%* ({pnl_neto:+.4f} USDT)\n"
             f"Modo: {'🔴 Real' if order_res.get('is_live') else '🧪 Simulación'}",
-            parse_mode="Markdown"
+            parse_mode="Markdown",
+            reply_markup=MAIN_KEYBOARD
         )
     except Exception as e:
-        await update.effective_message.reply_text(f"Error al cerrar posición {sym}: {e}")
+        await update.effective_message.reply_text(f"Error al cerrar posición {sym}: {e}", reply_markup=MAIN_KEYBOARD)
 
-async def cmd_autotrade(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_text_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Detecta cuando el usuario presiona un botón del teclado permanente"""
     if not await guard(update): return
-    global AUTOTRADE_ENABLED
-    arg = context.args[0].lower() if context.args else ""
-    if arg == "on":
-        AUTOTRADE_ENABLED = True
-        await update.effective_message.reply_text("✅ *Auto-Trading ACTIVADO*.", parse_mode="Markdown")
-    elif arg == "off":
-        AUTOTRADE_ENABLED = False
-        await update.effective_message.reply_text("⏸️ *Auto-Trading PAUSADO*.", parse_mode="Markdown")
-    else:
-        status = "ACTIVADO ✅" if AUTOTRADE_ENABLED else "PAUSADO ⏸️"
-        await update.effective_message.reply_text(f"Estado del Auto-Trading: *{status}*\nUsa `/autotrade on` o `/autotrade off`", parse_mode="Markdown")
+    text = update.effective_message.text.strip() if update.effective_message else ""
 
-async def cmd_balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await guard(update): return
-    try:
-        bal = exchange.fetch_balance()
-        rows = [f"• *{c}*: `{v}`" for c, v in bal.get("total", {}).items() if v and v > 0.0001]
-        await update.effective_message.reply_text(
-            "💼 *Balance en WEEX:*\n" + ("\n".join(rows) if rows else "Sin fondos detectados."),
-            parse_mode="Markdown"
-        )
-    except Exception as exc:
-        await update.effective_message.reply_text(f"Error consultando balance: {exc}")
-
-async def cmd_estado(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await guard(update): return
-    open_count = len(get_open_positions())
-    is_live = (not DRY_RUN) and ALLOW_LIVE
-    s = STRATEGIES[ACTIVE_STRATEGY]
-    await update.effective_message.reply_text(
-        f"⚙️ *ESTADO DEL MASTER BOT*\n\n"
-        f"• Estrategia Activa: *{s['name']}*\n"
-        f"• Take Profit: `+{s['tp_pct']}%` | Stop Loss: `-{s['sl_pct']}%`\n"
-        f"• Auto-Trading: *{'ACTIVADO ✅' if AUTOTRADE_ENABLED else 'PAUSADO ⏸️'}*\n"
-        f"• Modo Órdenes: *{'🔴 DINERO REAL' if is_live else '🧪 SIMULACIÓN (DRY_RUN)'}*\n"
-        f"• Posiciones abiertas: *{open_count}/{MAX_OPEN_POSITIONS}*\n"
-        f"• Monto por trade: *{AMOUNT_USDT} USDT*\n"
-        f"• Comisión estimada considerada: `{(FEE_PCT*100):.2f}% por lado`\n"
-        f"• Watchlist: `{', '.join(WATCHLIST)}`\n"
-        f"• Temporalidades: Macro `{TIMEFRAME_MACRO}` + Micro `{TIMEFRAME_MICRO}`",
-        parse_mode="Markdown"
-    )
-
-async def cmd_precio(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await guard(update): return
-    sym = (context.args[0] if context.args else "BTC/USDT").upper()
-    try:
-        t = exchange.fetch_ticker(sym)
-        await update.effective_message.reply_text(
-            f"💰 *{sym}*: `${t.get('last')}`\n"
-            f"24h: `{t.get('percentage', '?')}%` | Máx: `${t.get('high')}` | Mín: `${t.get('low')}`",
-            parse_mode="Markdown"
-        )
-    except Exception as exc:
-        await update.effective_message.reply_text(f"No pude obtener {sym}: {exc}")
+    if text == "📊 Posiciones":
+        await cmd_posiciones(update, context)
+    elif text == "💰 PnL Neto":
+        await cmd_pnl(update, context)
+    elif text == "⚙️ Estrategias":
+        await cmd_estrategia(update, context)
+    elif text == "💼 Balance":
+        await cmd_balance(update, context)
+    elif text == "🤖 Auto-Trading":
+        await cmd_autotrade(update, context)
+    elif text == "ℹ️ Estado":
+        await cmd_estado(update, context)
 
 # ==================== INICIO PRINCIPAL ====================
 def main():
@@ -649,9 +722,11 @@ def main():
 
     app = ApplicationBuilder().token(TOKEN).build()
 
+    # Comandos escritos con barra /
     for name, callback in [
         ("start", cmd_start),
         ("help", cmd_start),
+        ("menu", cmd_start),
         ("estrategia", cmd_estrategia),
         ("pnl", cmd_pnl),
         ("posiciones", cmd_posiciones),
@@ -659,9 +734,14 @@ def main():
         ("autotrade", cmd_autotrade),
         ("balance", cmd_balance),
         ("estado", cmd_estado),
-        ("precio", cmd_precio),
     ]:
         app.add_handler(CommandHandler(name, callback))
+
+    # Manejador de clics en botones de teclado táctil
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_buttons))
+
+    # Manejador de botones interactivos inline
+    app.add_handler(CallbackQueryHandler(handle_callback_query))
 
     app.job_queue.run_repeating(master_trading_engine, interval=INTERVAL, first=10)
     log.info("Motor Master activo cada %s segundos.", INTERVAL)
