@@ -1,71 +1,4 @@
 
-def manejar_comandos_chat(token):
-    try:
-        import requests
-        import ejecutor_weex
-        url = f"https://api.telegram.org/bot{token}/getUpdates?offset=-1"
-        r = requests.get(url, timeout=5)
-        if r.status_code == 200:
-            data = r.json()
-            if data.get("result"):
-                ultimo = data["result"][-1]
-                texto = ultimo.get("message", {}).get("text", "").strip().lower()
-                if texto == "/estado":
-                    return "🟢 Sistema WEEX activo con memoria dinámica y ejecutor vinculado."
-                elif texto == "/simular":
-                    res = ejecutor_weex.ejecutar_orden_simulada("BTCUSDT", "BUY", 68000, 0.01)
-                    return f"⚡ Orden simulada ejecutada desde Telegram:\n{res}"
-    except Exception as e:
-        return f"Error procesando comando: {e}"
-    return None
-import ejecutor_weex
-def procesar_comandos_telegram(token):
-    try:
-        import requests
-        url = f"https://api.telegram.org/bot{token}/getUpdates?offset=-1"
-        r = requests.get(url, timeout=5)
-        if r.status_code == 200:
-            data = r.json()
-            if data.get("result"):
-                ultimo_msg = data["result"][-1]
-                texto = ultimo_msg.get("message", {}).get("text", "")
-                if texto.lower() == "/estado":
-                    return "El bot WEEX está operando correctamente con memoria dinámica."
-    except Exception:
-        pass
-    return None
-
-def verificar_volatilidad_y_precios(simbolo="BTCUSDT", umbral_porcentaje=2.0):
-    try:
-        import requests
-        url = f"https://api.binance.com/api/v3/ticker/price?symbol={simbolo}"
-        r = requests.get(url, timeout=5)
-        if r.status_code == 200:
-            precio_actual = float(r.json().get("price", 0))
-            # Lógica de comparación de umbral de volatilidad
-            return f"Monitoreo {simbolo}: Precio actual estable en ${precio_actual}. Sin alertas de volatilidad extrema."
-    except Exception as e:
-        return f"Modo offline / Red intermitente: {e}"
-
-def analizar_memoria_previa():
-    try:
-        with open("memoria_razonamiento.md", "r", encoding="utf-8") as f:
-            lineas = f.readlines()
-        registros = [l for l in lineas if "## [" in l]
-        total_registros = len(registros)
-        return f"Total de análisis previos registrados: {total_registros}. Sistema operando con memoria dinámica."
-    except Exception:
-        return "Iniciando primer registro histórico."
-
-TELEGRAM_CHAT_ID = "1649392552"
-
-import datetime
-
-def guardar_estudio_local(titulo, analisis):
-    timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    entrada = f"\n\n## [{timestamp}] {titulo}\n{analisis}\n"
-    with open("memoria_razonamiento.md", "a", encoding="utf-8") as memoria:
-        memoria.write(entrada)
 """
 Asistente WEEX + Telegram: monitor de mercado y ranking técnico.
 Por seguridad, el análisis/monitorización NO envía órdenes automáticamente.
@@ -130,7 +63,6 @@ async def guard(update: Update) -> bool:
 
 
 def get_exchange():
-    # Las claves son opcionales para consultar datos públicos.
     config = {"enableRateLimit": True, "options": {"defaultType": MARKET_TYPE}}
     if API_KEY and API_SECRET and API_PASSPHRASE:
         config.update({"apiKey": API_KEY, "secret": API_SECRET, "password": API_PASSPHRASE})
@@ -262,8 +194,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/estado - configuración y modo\n"
         "/balance - saldo (requiere API de lectura)\n"
         "/comprar BTC/USDT 20 y /vender BTC/USDT 20 - órdenes manuales protegidas\n\n"
-        "El ranking es un filtro técnico, no una promesa de rentabilidad. "
-        "El monitor no ejecuta operaciones automáticamente."
+        "El ranking es un filtro técnico, no una promesa de rentabilidad."
     )
 
 
@@ -382,8 +313,8 @@ async def cmd_aprendizaje(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.effective_message.reply_text(report)
     else:
         status = "ACTIVO" if learning.enabled else "PAUSADO"
-        hours = f"{os.getenv('LEARNING_START_HOUR','8')}:00–{os.getenv('LEARNING_END_HOUR','20')}:00 hora local de Windows"
-        await update.effective_message.reply_text(f"🧠 Centro: {status}\nHorario: {hours}\nPares: {', '.join(learning.symbols)}\nIntervalo: {INTERVAL}s\n{learning.report()}")
+        hours = f"{os.getenv('LEARNING_START_HOUR','8')}:00–{os.getenv('LEARNING_END_HOUR','20')}:00"
+        await update.effective_message.reply_text(f"🧠 Centro: {status}\nHorario: {hours}\nPares: {', '.join(learning.symbols)}\n{learning.report()}")
 
 
 async def learning_job(context: ContextTypes.DEFAULT_TYPE):
@@ -408,7 +339,7 @@ async def cmd_estado(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"⚙️ Estado\nMercado: {MARKET_TYPE}\nTimeframe: {TIMEFRAME}\n"
         f"Watchlist: {', '.join(WATCHLIST)}\nIntervalo: {INTERVAL}s\n"
         f"Monitor: {'ON' if monitor_enabled else 'OFF'}\n"
-        f"DRY_RUN: {DRY_RUN}\nÓrdenes reales autorizadas por configuración: {ALLOW_LIVE}\n"
+        f"DRY_RUN: {DRY_RUN}\nÓrdenes reales autorizadas: {ALLOW_LIVE}\n"
         f"Aprendizaje: {'ACTIVO' if learning and learning.enabled else 'PAUSADO'}"
     )
 
@@ -469,7 +400,7 @@ def main():
     exchange.load_markets()
     global learning
     learning = LearningCenter(exchange, WATCHLIST, TIMEFRAME)
-    log.info("WEEX conectado; %s mercados. Solo lectura hasta solicitar orden manual.", len(exchange.markets))
+    log.info("WEEX conectado; %s mercados.", len(exchange.markets))
     app = ApplicationBuilder().token(TOKEN).build()
     for name, callback in [
         ("start", cmd_start), ("help", cmd_start), ("precio", cmd_precio),
@@ -480,76 +411,9 @@ def main():
         app.add_handler(CommandHandler(name, callback))
     app.job_queue.run_repeating(market_job, interval=INTERVAL, first=15)
     app.job_queue.run_repeating(learning_job, interval=INTERVAL, first=30)
-    log.info("Bot iniciado.")
+    log.info("Bot de Telegram iniciado.")
     app.run_polling()
 
 
 if __name__ == "__main__":
     main()
-
-
-# --- Modulo de Auto-Estudio y Memoria Local ---
-import datetime 
-def guardar_estudio_local(titulo, analisis): 
-    timestamp = datetime.datetime.now().strftime("%%Y-%%m-%%d %%H:%%M:%%S") 
-    entrada = f"\n\n## [{timestamp}] {titulo}\n{analisis}\n" 
-    with open("memoria_razonamiento.md", "a", encoding="utf-8") as memoria: 
-        memoria.write(entrada) 
-with open("bot_weex.py", "a", encoding="utf-8") as f: 
-    f.write("\n\n# --- Modulo de Auto-Estudio y Memoria Local ---\n") 
-
-
-# --- Modulo de Auto-Estudio y Memoria Local ---
-
-
-# --- Modulo de Auto-Estudio y Memoria Local ---
-
-
-# --- Modulo de Auto-Estudio y Memoria Local ---
-
-
-# --- Modulo de Auto-Estudio y Memoria Local ---
-
-
-# --- Modulo de Auto-Estudio y Memoria Local ---
-
-
-# --- Modulo de Auto-Estudio y Memoria Local ---
-
-
-# --- Modulo de Auto-Estudio y Memoria Local ---
-
-
-# --- Modulo de Auto-Estudio y Memoria Local ---
-
-
-# --- Modulo de Auto-Estudio y Memoria Local ---
-
-    # Procesar peticiones de Telegram
-    respuesta_tg = manejar_comandos_chat(TOKEN_TELEGRAM)
-    if respuesta_tg:
-        print(f"[Telegram] {respuesta_tg}")
-
-
-# --- Modulo de Auto-Estudio y Memoria Local ---
-
-
-# --- Modulo de Auto-Estudio y Memoria Local ---
-
-
-# --- Modulo de Auto-Estudio y Memoria Local ---
-
-
-# --- Modulo de Auto-Estudio y Memoria Local ---
-
-
-# --- Modulo de Auto-Estudio y Memoria Local ---
-
-
-# --- Modulo de Auto-Estudio y Memoria Local ---
-
-
-# --- Modulo de Auto-Estudio y Memoria Local ---
-
-
-# --- Modulo de Auto-Estudio y Memoria Local ---
