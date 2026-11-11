@@ -1,10 +1,11 @@
 """
-WEEX TELEGRAM AUTONOMOUS TRADING BOT CON APRENDIZAJE ADAPTATIVO & TRACKING DE PnL
-- Opera de forma continua y autónoma buscando oportunidades de trading.
-- Calcula y acumula el PnL neto en USDT en tiempo real.
-- Motor de Aprendizaje: calibra los scores de entrada y Take Profit/Stop Loss
-  en base al rendimiento de sus operaciones anteriores.
-- Servidor keep_alive integrado para Render.
+WEEX MASTER AUTONOMOUS BOT: 3 ESTRATEGIAS + MULTI-TIMEFRAME + PnL NETO CON COMISIONES
+- 3 Estrategias seleccionables: Agresiva, Moderada y Conservadora.
+- Multi-Temporalidad: Confirma tendencia en 15m y entrada precisa en 1m/5m.
+- PnL Neto Real: Descuenta automáticamente las comisiones del exchange en cada cálculo.
+- Cooldown tras Stop Loss: Evita recomprar un activo en caída por 5 minutos.
+- Control total desde Telegram con comandos interactivos (/estrategia, /pnl, /posiciones).
+- Servidor keep_alive para Render 24/7 sin suspensión.
 """
 
 import os
@@ -23,42 +24,72 @@ from keep_alive import start_keep_alive
 load_dotenv()
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
-log = logging.getLogger("weex-bot")
+log = logging.getLogger("weex-master")
 
 # ==================== CONFIGURACIÓN GENERAL ====================
 API_KEY = os.getenv("WEEX_API_KEY", "")
 API_SECRET = os.getenv("WEEX_API_SECRET", "")
-API_PASSPHRASE = os.getenv("WEEX_API_PASSPHRASE", "")
+API_PASSPHRASE = os.getenv("WEEX_API_PASSPHRASE", os.getenv("WEEX_API_PASSWORD", ""))
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
-# Por defecto configurado para operar continuamente
+# Modos de ejecución
 DRY_RUN = os.getenv("DRY_RUN", "false").lower() == "true"
 ALLOW_LIVE = os.getenv("ALLOW_LIVE_TRADING", "true").lower() == "true"
 MARKET_TYPE = os.getenv("MARKET_TYPE", "spot")
-TIMEFRAME = os.getenv("TIMEFRAME", "15m")
-INTERVAL = max(30, int(os.getenv("CHECK_INTERVAL_SEC", "45")))  # Cada 45 segundos para alta actividad
+
+# Temporalidades
+TIMEFRAME_MACRO = os.getenv("TIMEFRAME", "15m")       # Tendencia general
+TIMEFRAME_MICRO = os.getenv("ENTRY_TIMEFRAME", "1m")   # Gatillo de entrada precisa
+INTERVAL = max(20, int(os.getenv("CHECK_INTERVAL_SEC", "35"))) # Escaneo cada 35s
 AMOUNT_USDT = float(os.getenv("TRADE_AMOUNT_USDT", "10"))
 
-# Parámetros Base del Auto-Trading
-AUTOTRADE_ENABLED = os.getenv("AUTOTRADE_ENABLED", "true").lower() == "true"
-BASE_BUY_SCORE = int(os.getenv("AUTO_BUY_SCORE", "70"))
-BASE_TP_PCT = float(os.getenv("AUTO_TP_PCT", "1.8"))           # Take profit rápido (+1.8%)
-BASE_SL_PCT = float(os.getenv("AUTO_SL_PCT", "1.4"))           # Stop loss ajustado (-1.4%)
-MAX_OPEN_POSITIONS = int(os.getenv("MAX_OPEN_POSITIONS", "3"))
+# Comisión del exchange estimada por operación (0.2% por lado)
+FEE_PCT = float(os.getenv("FEE_PCT", "0.002")) 
 
-# Indicadores técnicos
-EMA_FAST = int(os.getenv("EMA_FAST", "9"))
-EMA_SLOW = int(os.getenv("EMA_SLOW", "21"))
-RSI_PERIOD = int(os.getenv("RSI_PERIOD", "14"))
+# Cooldown tras Stop Loss (en segundos)
+COOLDOWN_SL_SEC = int(os.getenv("COOLDOWN_AFTER_SL_SEC", "300"))
+cooldown_tracker = {} # symbol -> timestamp
+
+# ==================== 3 ESTRATEGIAS DE TRADING ====================
+STRATEGIES = {
+    "conservadora": {
+        "name": "🛡️ Conservadora",
+        "tp_pct": 3.0,     # +3.0% para superar holgadamente las comisiones
+        "sl_pct": 1.2,     # -1.2% corte rápido de pérdidas
+        "min_score": 78,   # Muy exigente
+        "desc": "Alta selectividad. Pocas operaciones pero de alta probabilidad.",
+    },
+    "moderada": {
+        "name": "⚖️ Moderada",
+        "tp_pct": 2.4,     # +2.4% ganancia sólida neta
+        "sl_pct": 1.5,     # -1.5%
+        "min_score": 70,   # Equilibrada
+        "desc": "Equilibrio ideal entre frecuencia y protección de capital.",
+    },
+    "agresiva": {
+        "name": "⚡ Agresiva",
+        "tp_pct": 2.0,     # +2.0% scalping rápido
+        "sl_pct": 1.4,     # -1.4%
+        "min_score": 62,   # Mayor frecuencia
+        "desc": "Scalping activo con mayor cantidad de entradas.",
+    }
+}
+
+ACTIVE_STRATEGY = os.getenv("ESTRATEGIA", "moderada").lower()
+if ACTIVE_STRATEGY not in STRATEGIES:
+    ACTIVE_STRATEGY = "moderada"
+
+AUTOTRADE_ENABLED = os.getenv("AUTOTRADE_ENABLED", "true").lower() == "true"
+MAX_OPEN_POSITIONS = int(os.getenv("MAX_OPEN_POSITIONS", "3"))
 
 WATCHLIST = [x.strip().upper() for x in os.getenv(
     "SYMBOLS", "BTC/USDT,ETH/USDT,SOL/USDT,DOGE/USDT,XRP/USDT").split(",") if x.strip()]
 
-DB_PATH = Path("weex_trading_brain.db")
+DB_PATH = Path("weex_master_pnl.db")
 exchange = None
 
-# ==================== BASE DE DATOS & MEMORIA DE APRENDIZAJE ====================
+# ==================== BASE DE DATOS & REGISTRO ====================
 def init_db():
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute("""
@@ -71,8 +102,8 @@ def init_db():
                 amount_usdt REAL NOT NULL,
                 tp_price REAL NOT NULL,
                 sl_price REAL NOT NULL,
+                strategy_name TEXT NOT NULL,
                 entry_score INTEGER NOT NULL,
-                entry_rsi REAL NOT NULL,
                 opened_at TEXT NOT NULL,
                 status TEXT NOT NULL DEFAULT 'OPEN'
             )
@@ -86,10 +117,11 @@ def init_db():
                 exit_price REAL NOT NULL,
                 amount_coin REAL NOT NULL,
                 amount_usdt REAL NOT NULL,
-                pnl_usdt REAL NOT NULL,
-                pnl_pct REAL NOT NULL,
-                entry_score INTEGER,
-                entry_rsi REAL,
+                pnl_bruto_usdt REAL NOT NULL,
+                comision_usdt REAL NOT NULL,
+                pnl_neto_usdt REAL NOT NULL,
+                pnl_neto_pct REAL NOT NULL,
+                strategy_name TEXT NOT NULL,
                 close_reason TEXT NOT NULL,
                 opened_at TEXT NOT NULL,
                 closed_at TEXT NOT NULL
@@ -104,71 +136,30 @@ def get_open_positions():
         cur.execute("SELECT * FROM live_positions WHERE status = 'OPEN'")
         return [dict(row) for row in cur.fetchall()]
 
-def save_new_position(symbol, side, entry_price, amount_coin, amount_usdt, tp_price, sl_price, score, rsi_val):
+def save_new_position(symbol, side, entry_price, amount_coin, amount_usdt, tp_price, sl_price, strategy, score):
     with sqlite3.connect(DB_PATH) as conn:
         cur = conn.cursor()
         cur.execute("""
             INSERT OR REPLACE INTO live_positions 
-            (symbol, side, entry_price, amount_coin, amount_usdt, tp_price, sl_price, entry_score, entry_rsi, opened_at, status)
+            (symbol, side, entry_price, amount_coin, amount_usdt, tp_price, sl_price, strategy_name, entry_score, opened_at, status)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'OPEN')
-        """, (symbol, side, entry_price, amount_coin, amount_usdt, tp_price, sl_price, score, rsi_val, datetime.now(timezone.utc).isoformat()))
+        """, (symbol, side, entry_price, amount_coin, amount_usdt, tp_price, sl_price, strategy, score, datetime.now(timezone.utc).isoformat()))
         conn.commit()
 
-def record_closed_trade(pos, exit_price, pnl_usdt, pnl_pct, reason):
+def record_closed_trade(pos, exit_price, pnl_bruto, comision, pnl_neto, pnl_neto_pct, reason):
     with sqlite3.connect(DB_PATH) as conn:
         cur = conn.cursor()
         cur.execute("""
             INSERT INTO trade_history 
-            (symbol, side, entry_price, exit_price, amount_coin, amount_usdt, pnl_usdt, pnl_pct, entry_score, entry_rsi, close_reason, opened_at, closed_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            (symbol, side, entry_price, exit_price, amount_coin, amount_usdt, pnl_bruto_usdt, comision_usdt, pnl_neto_usdt, pnl_neto_pct, strategy_name, close_reason, opened_at, closed_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             pos["symbol"], pos["side"], pos["entry_price"], exit_price, pos["amount_coin"], 
-            pos["amount_usdt"], pnl_usdt, pnl_pct, pos.get("entry_score", 0), pos.get("entry_rsi", 0.0),
+            pos["amount_usdt"], pnl_bruto, comision, pnl_neto, pnl_neto_pct, pos.get("strategy_name", ACTIVE_STRATEGY),
             reason, pos["opened_at"], datetime.now(timezone.utc).isoformat()
         ))
         cur.execute("DELETE FROM live_positions WHERE symbol = ?", (pos["symbol"],))
         conn.commit()
-
-# ==================== MOTOR DE APRENDIZAJE ADAPTATIVO ====================
-def get_adaptive_settings():
-    with sqlite3.connect(DB_PATH) as conn:
-        cur = conn.cursor()
-        cur.execute("SELECT pnl_pct, entry_score FROM trade_history ORDER BY id DESC LIMIT 15")
-        rows = cur.fetchall()
-
-    if not rows or len(rows) < 3:
-        return {
-            "score_threshold": BASE_BUY_SCORE,
-            "tp_pct": BASE_TP_PCT,
-            "sl_pct": BASE_SL_PCT,
-            "confidence": "Iniciando aprendizaje (modo base)",
-            "winrate": 0.0
-        }
-
-    total = len(rows)
-    wins = sum(1 for r in rows if r[0] > 0)
-    winrate = (wins / total) * 100
-
-    if winrate < 50:
-        adaptive_score = min(85, BASE_BUY_SCORE + 5)
-        adaptive_tp = max(1.2, BASE_TP_PCT - 0.3)
-        confidence = f"Defensivo (Winrate {winrate:.0f}% -> Subiendo exigencia a Score {adaptive_score})"
-    elif winrate >= 70:
-        adaptive_score = max(65, BASE_BUY_SCORE - 3)
-        adaptive_tp = BASE_TP_PCT + 0.4
-        confidence = f"Óptimo (Winrate {winrate:.0f}% -> Alta precisión)"
-    else:
-        adaptive_score = BASE_BUY_SCORE
-        adaptive_tp = BASE_TP_PCT
-        confidence = f"Equilibrado (Winrate {winrate:.0f}%)"
-
-    return {
-        "score_threshold": adaptive_score,
-        "tp_pct": adaptive_tp,
-        "sl_pct": BASE_SL_PCT,
-        "confidence": confidence,
-        "winrate": winrate
-    }
 
 def get_pnl_summary():
     with sqlite3.connect(DB_PATH) as conn:
@@ -176,19 +167,21 @@ def get_pnl_summary():
         cur.execute("""
             SELECT 
                 COUNT(*),
-                SUM(CASE WHEN pnl_usdt > 0 THEN 1 ELSE 0 END),
-                SUM(CASE WHEN pnl_usdt <= 0 THEN 1 ELSE 0 END),
-                SUM(pnl_usdt),
-                AVG(pnl_pct)
+                SUM(CASE WHEN pnl_neto_usdt > 0 THEN 1 ELSE 0 END),
+                SUM(CASE WHEN pnl_neto_usdt <= 0 THEN 1 ELSE 0 END),
+                SUM(pnl_neto_usdt),
+                SUM(comision_usdt),
+                AVG(pnl_neto_pct)
             FROM trade_history
         """)
         row = cur.fetchone()
-        total, wins, losses, total_pnl, avg_pct = row
+        total, wins, losses, total_neto, total_fees, avg_pct = row
 
     total = total or 0
     wins = wins or 0
     losses = losses or 0
-    total_pnl = total_pnl or 0.0
+    total_neto = total_neto or 0.0
+    total_fees = total_fees or 0.0
     avg_pct = avg_pct or 0.0
     winrate = (wins / total * 100) if total > 0 else 0.0
 
@@ -196,12 +189,13 @@ def get_pnl_summary():
         "total": total,
         "wins": wins,
         "losses": losses,
-        "total_pnl": total_pnl,
+        "total_neto": total_neto,
+        "total_fees": total_fees,
         "avg_pct": avg_pct,
         "winrate": winrate
     }
 
-# ==================== SEGURIDAD & CONEXIÓN ====================
+# ==================== TELEGRAM GUARD & EXCHANGE ====================
 def authorized(update: Update) -> bool:
     if not CHAT_ID:
         return True
@@ -227,68 +221,53 @@ def rsi(series: pd.Series, period: int = 14) -> pd.Series:
     rs = gain / loss.replace(0, 1e-12)
     return 100 - (100 / (1 + rs))
 
-# ==================== ANÁLISIS TÉCNICO ====================
-def analyze_symbol(symbol: str) -> dict:
-    candles = exchange.fetch_ohlcv(symbol, timeframe=TIMEFRAME, limit=100)
-    if not candles or len(candles) < max(EMA_SLOW, RSI_PERIOD) + 5:
-        raise ValueError("Historial insuficiente")
-    df = pd.DataFrame(candles, columns=["ts", "open", "high", "low", "close", "volume"])
-    close = df["close"]
-    df["ema_fast"] = close.ewm(span=EMA_FAST, adjust=False).mean()
-    df["ema_slow"] = close.ewm(span=EMA_SLOW, adjust=False).mean()
-    df["rsi"] = rsi(close, RSI_PERIOD)
-    ema12 = close.ewm(span=12, adjust=False).mean()
-    ema26 = close.ewm(span=26, adjust=False).mean()
-    df["macd"] = ema12 - ema26
-    df["macd_signal"] = df["macd"].ewm(span=9, adjust=False).mean()
-    df["vol_avg"] = df["volume"].rolling(20).mean()
+# ==================== ANÁLISIS MULTI-TEMPORALIDAD ====================
+def analyze_multi_timeframe(symbol: str) -> dict:
+    # 1. Macro (15m): Tendencia General
+    candles_macro = exchange.fetch_ohlcv(symbol, timeframe=TIMEFRAME_MACRO, limit=60)
+    if not candles_macro or len(candles_macro) < 25:
+        raise ValueError("Historial macro insuficiente")
+    df_m = pd.DataFrame(candles_macro, columns=["ts", "open", "high", "low", "close", "vol"])
+    c_m = df_m["close"]
+    ema9_m = c_m.ewm(span=9, adjust=False).mean().iloc[-1]
+    ema21_m = c_m.ewm(span=21, adjust=False).mean().iloc[-1]
+    tendencia_alcista = ema9_m > ema21_m
 
-    last = df.iloc[-1]
-    prev = df.iloc[-2]
-    price = float(last["close"])
-    reasons = []
+    # 2. Micro (1m): Gatillo de Entrada
+    candles_micro = exchange.fetch_ohlcv(symbol, timeframe=TIMEFRAME_MICRO, limit=60)
+    if not candles_micro or len(candles_micro) < 25:
+        raise ValueError("Historial micro insuficiente")
+    df_u = pd.DataFrame(candles_micro, columns=["ts", "open", "high", "low", "close", "vol"])
+    c_u = df_u["close"]
+    ema9_u = c_u.ewm(span=9, adjust=False).mean().iloc[-1]
+    ema21_u = c_u.ewm(span=21, adjust=False).mean().iloc[-1]
+    rsi_u = float(rsi(c_u, 14).iloc[-1])
+    vol_avg = df_u["vol"].rolling(15).mean().iloc[-1]
+    vol_ratio = float(df_u["vol"].iloc[-1] / vol_avg) if pd.notna(vol_avg) and vol_avg > 0 else 1.0
+
+    last_price = float(c_u.iloc[-1])
+
     score = 0
-
-    if last["ema_fast"] > last["ema_slow"]:
+    if tendencia_alcista:
+        score += 35
+    if ema9_u > ema21_u:
+        score += 20
+    if 40 <= rsi_u <= 65:
         score += 25
-        reasons.append("EMA 9 > EMA 21")
-    if last["macd"] > last["macd_signal"]:
-        score += 20
-        reasons.append("MACD Cruz Alcista")
-
-    rv = float(last["rsi"])
-    if 40 <= rv <= 65:
-        score += 20
-        reasons.append(f"RSI en zona impulsiva ({rv:.1f})")
-    elif 30 <= rv < 40:
+    elif 30 <= rsi_u < 40:
         score += 15
-        reasons.append(f"RSI saliendo de sobreventa ({rv:.1f})")
-    elif rv > 70:
-        score -= 10
-        reasons.append(f"RSI en sobrecompra ({rv:.1f})")
+    if vol_ratio >= 1.2:
+        score += 20
 
-    vol_ratio = float(last["volume"] / last["vol_avg"]) if pd.notna(last["vol_avg"]) and last["vol_avg"] else 0
-    if vol_ratio >= 1.3:
-        score += 15
-        reasons.append(f"Volumen activo ({vol_ratio:.1f}x)")
-    elif vol_ratio >= 1.0:
-        score += 8
-
-    if price > float(last["ema_fast"]):
-        score += 10
-        reasons.append("Precio > EMA rápida")
-    if last["ema_fast"] > prev["ema_fast"]:
-        score += 10
-
-    signal = "ALCISTA" if score >= 65 else "NEUTRAL" if score >= 40 else "BAJISTA"
+    signal = "ALCISTA" if (tendencia_alcista and score >= 60) else "NEUTRAL"
     return {
         "symbol": symbol,
-        "price": price,
-        "score": max(0, min(100, score)),
-        "rsi": rv,
+        "price": last_price,
+        "score": score,
+        "rsi": rsi_u,
+        "macro_bullish": tendencia_alcista,
         "volume_ratio": vol_ratio,
         "signal": signal,
-        "reasons": reasons,
     }
 
 # ==================== EJECUTOR DE ÓRDENES ====================
@@ -316,27 +295,29 @@ def execute_order(symbol: str, side: str, amount_coin: float, reason_text: str =
             "side": side,
         }
     except Exception as exc:
-        log.error("Error en orden WEEX: %s", exc)
+        log.error("Fallo al enviar orden a WEEX: %s", exc)
         return {"success": False, "error": str(exc), "is_live": True}
 
-# ==================== BUCLE DE TRADING ACTIVO Y CONTINUO ====================
-async def autonomous_engine(context: ContextTypes.DEFAULT_TYPE):
-    """Bucle continuo: Gestiona PnL en vivo, cierra en TP/SL y busca nuevas oportunidades."""
+# ==================== BUCLE DE TRADING ACTIVO ====================
+async def master_trading_engine(context: ContextTypes.DEFAULT_TYPE):
     global AUTOTRADE_ENABLED
     if not exchange:
         return
 
-    settings = get_adaptive_settings()
-    current_tp_pct = settings["tp_pct"]
-    current_sl_pct = settings["sl_pct"]
-    required_score = settings["score_threshold"]
+    strat = STRATEGIES[ACTIVE_STRATEGY]
+    tp_pct = strat["tp_pct"]
+    sl_pct = strat["sl_pct"]
+    min_score = strat["min_score"]
 
-    # 1. Vigilar posiciones abiertas para asegurar ganancias o frenar pérdidas
+    now_ts = datetime.now().timestamp()
+
+    # 1. MONITOREO DE POSICIONES ABIERTAS (CIERRES EN TP O SL)
     open_positions = get_open_positions()
     for pos in open_positions:
         sym = pos["symbol"]
         entry_price = pos["entry_price"]
         amount_coin = pos["amount_coin"]
+        amount_usdt = pos["amount_usdt"]
         tp_price = pos["tp_price"]
         sl_price = pos["sl_price"]
 
@@ -344,26 +325,30 @@ async def autonomous_engine(context: ContextTypes.DEFAULT_TYPE):
             ticker = exchange.fetch_ticker(sym)
             curr_price = float(ticker["last"])
         except Exception as e:
-            log.warning("No se pudo obtener precio de %s: %s", sym, e)
             continue
 
-        pnl_pct = ((curr_price - entry_price) / entry_price) * 100
-        pnl_usdt = (curr_price - entry_price) * amount_coin
+        pnl_bruto_pct = ((curr_price - entry_price) / entry_price) * 100
+        pnl_bruto_usdt = (curr_price - entry_price) * amount_coin
 
-        # A) Take Profit Alcanzado (GANANCIA)
+        comision_estimada = (amount_usdt * FEE_PCT) * 2
+        pnl_neto_usdt = pnl_bruto_usdt - comision_estimada
+        pnl_neto_pct = pnl_bruto_pct - (FEE_PCT * 200)
+
+        # A) Take Profit Alcanzado (GANANCIA NETA)
         if curr_price >= tp_price:
-            order_res = execute_order(sym, "sell", amount_coin, f"TP Alcanzado (+{pnl_pct:.2f}%)")
-            record_closed_trade(pos, curr_price, pnl_usdt, pnl_pct, "TAKE_PROFIT")
+            order_res = execute_order(sym, "sell", amount_coin, f"TP Alcanzado (+{pnl_neto_pct:.2f}% neto)")
+            record_closed_trade(pos, curr_price, pnl_bruto_usdt, comision_estimada, pnl_neto_usdt, pnl_neto_pct, "TAKE_PROFIT")
 
-            pnl_stats = get_pnl_summary()
-            sign = "🟢 +" if pnl_usdt >= 0 else "🔴 "
+            summary = get_pnl_summary()
+            sign = "🟢 +" if pnl_neto_usdt >= 0 else "🔴 "
             msg = (
                 f"🎯 *¡TAKE PROFIT ALCANZADO!*\n"
-                f"Par: `{sym}`\n"
+                f"Par: `{sym}` | Estrategia: *{strat['name']}*\n"
                 f"Entrada: `${entry_price:g}` ➡️ Salida: `${curr_price:g}`\n"
-                f"PnL Operación: *{sign}{pnl_usdt:.4f} USDT ({pnl_pct:+.2f}%)*\n"
-                f"💰 *PnL ACUMULADO TOTAL:* `{pnl_stats['total_pnl']:+.4f} USDT`\n"
-                f"Acierto: `{pnl_stats['winrate']:.1f}%` ({pnl_stats['wins']} Ganadas / {pnl_stats['losses']} Perdidas)\n"
+                f"PnL Neto: *{sign}{pnl_neto_usdt:.4f} USDT ({pnl_neto_pct:+.2f}%)*\n"
+                f"_(Comisión descontada: -${comision_estimada:.4f} USDT)_\n\n"
+                f"💰 *PnL NETO ACUMULADO:* `{summary['total_neto']:+.4f} USDT`\n"
+                f"Acierto: `{summary['winrate']:.1f}%` ({summary['wins']} Ganadas / {summary['losses']} Perdidas)\n"
                 f"Modo: {'🔴 Dinero Real' if order_res.get('is_live') else '🧪 Simulación'}"
             )
             if CHAT_ID:
@@ -374,17 +359,19 @@ async def autonomous_engine(context: ContextTypes.DEFAULT_TYPE):
 
         # B) Stop Loss Alcanzado (PROTECCIÓN)
         elif curr_price <= sl_price:
-            order_res = execute_order(sym, "sell", amount_coin, f"SL Ejecutado ({pnl_pct:.2f}%)")
-            record_closed_trade(pos, curr_price, pnl_usdt, pnl_pct, "STOP_LOSS")
+            order_res = execute_order(sym, "sell", amount_coin, f"SL Ejecutado ({pnl_neto_pct:.2f}% neto)")
+            record_closed_trade(pos, curr_price, pnl_bruto_usdt, comision_estimada, pnl_neto_usdt, pnl_neto_pct, "STOP_LOSS")
 
-            pnl_stats = get_pnl_summary()
+            cooldown_tracker[sym] = now_ts + COOLDOWN_SL_SEC
+
+            summary = get_pnl_summary()
             msg = (
                 f"🛑 *STOP LOSS ACTIVADO*\n"
-                f"Par: `{sym}`\n"
+                f"Par: `{sym}` | Estrategia: *{strat['name']}*\n"
                 f"Entrada: `${entry_price:g}` ➡️ Salida: `${curr_price:g}`\n"
-                f"PnL Operación: `🔴 {pnl_usdt:.4f} USDT ({pnl_pct:.2f}%)`\n"
-                f"💰 *PnL ACUMULADO TOTAL:* `{pnl_stats['total_pnl']:+.4f} USDT`\n"
-                f"Acierto: `{pnl_stats['winrate']:.1f}%` ({pnl_stats['wins']} Ganadas / {pnl_stats['losses']} Perdidas)\n"
+                f"PnL Neto: `🔴 {pnl_neto_usdt:.4f} USDT ({pnl_neto_pct:+.2f}%)`\n"
+                f"⏳ Cooldown: Pausando {sym} por 5 minutos para evitar caídas.\n"
+                f"💰 *PnL NETO ACUMULADO:* `{summary['total_neto']:+.4f} USDT`\n"
                 f"Modo: {'🔴 Dinero Real' if order_res.get('is_live') else '🧪 Simulación'}"
             )
             if CHAT_ID:
@@ -393,7 +380,7 @@ async def autonomous_engine(context: ContextTypes.DEFAULT_TYPE):
                 except Exception:
                     pass
 
-    # 2. Buscar y abrir nuevas operaciones de trading continuo
+    # 2. BÚSQUEDA Y APERTURA DE NUEVAS OPERACIONES
     if not AUTOTRADE_ENABLED:
         return
 
@@ -407,32 +394,34 @@ async def autonomous_engine(context: ContextTypes.DEFAULT_TYPE):
         if len(active_symbols) >= MAX_OPEN_POSITIONS:
             break
 
+        if sym in cooldown_tracker and now_ts < cooldown_tracker[sym]:
+            continue
+
         try:
-            tech = analyze_symbol(sym)
+            tech = analyze_multi_timeframe(sym)
             score = tech["score"]
             price = tech["price"]
-            rsi_val = tech["rsi"]
 
-            if score >= required_score and tech["signal"] == "ALCISTA":
+            if score >= min_score and tech["signal"] == "ALCISTA":
                 amount_coin = float(exchange.amount_to_precision(sym, AMOUNT_USDT / price))
                 if amount_coin <= 0:
                     continue
 
-                tp_price = price * (1 + (current_tp_pct / 100))
-                sl_price = price * (1 - (current_sl_pct / 100))
+                tp_price = price * (1 + (tp_pct / 100))
+                sl_price = price * (1 - (sl_pct / 100))
 
-                order_res = execute_order(sym, "buy", amount_coin, f"Entrada Aprendizaje Score={score}")
+                order_res = execute_order(sym, "buy", amount_coin, f"Entrada {strat['name']} Score={score}")
                 if order_res.get("success"):
-                    save_new_position(sym, "buy", price, amount_coin, AMOUNT_USDT, tp_price, sl_price, score, rsi_val)
+                    save_new_position(sym, "buy", price, amount_coin, AMOUNT_USDT, tp_price, sl_price, ACTIVE_STRATEGY, score)
                     active_symbols.add(sym)
 
                     msg = (
-                        f"🚀 *NUEVA ENTRADA DE TRADING*\n"
-                        f"Par: `{sym}`\n"
+                        f"🚀 *NUEVA COMPRA MULTI-TIMEFRAME*\n"
+                        f"Par: `{sym}` | Estrategia: *{strat['name']}*\n"
                         f"Precio: `${price:g}` | Inversión: `{AMOUNT_USDT} USDT`\n"
-                        f"🎯 TP (+{current_tp_pct:.1f}%): `${tp_price:.4f}`\n"
-                        f"🛑 SL (-{current_sl_pct:.1f}%): `${sl_price:.4f}`\n"
-                        f"🧠 Score Técnico: *{score}/100* (Filtro mínimo: {required_score})\n"
+                        f"🎯 Take Profit (+{tp_pct}%): `${tp_price:.4f}`\n"
+                        f"🛑 Stop Loss (-{sl_pct}%): `${sl_price:.4f}`\n"
+                        f"Score: *{score}/100* (Tendencia 15m + Gatillo 1m)\n"
                         f"Modo: {'🔴 Dinero Real' if order_res.get('is_live') else '🧪 Simulación'}"
                     )
                     if CHAT_ID:
@@ -446,61 +435,72 @@ async def autonomous_engine(context: ContextTypes.DEFAULT_TYPE):
 # ==================== COMANDOS TELEGRAM ====================
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await guard(update): return
+    strat = STRATEGIES[ACTIVE_STRATEGY]
     msg = (
-        "🤖 *WEEX TRADING BOT INTELIGENTE & ACTIVO*\n\n"
-        "Comandos en vivo:\n"
-        "• `/pnl` - Ganancias netas totales acumuladas en USDT\n"
-        "• `/posiciones` - Ver operaciones en curso y su ganancia en vivo\n"
-        "• `/aprendizaje` - Estado del motor de optimización\n"
-        "• `/autotrade on|off` - Activar o pausar trading automático\n"
-        "• `/cerrar BTC/USDT` - Cerrar una posición inmediatamente\n"
-        "• `/balance` - Saldo disponible en WEEX\n"
-        "• `/estado` - Estado general del sistema\n"
-        "• `/ranking` - Mejores activos del momento\n"
+        "🤖 *WEEX MASTER BOT (MULTI-ESTRATEGIA & PnL NETO)*\n\n"
+        f"Estrategia actual: *{strat['name']}*\n\n"
+        "Comandos principales:\n"
+        "• `/estrategia` - Ver o cambiar estrategia (`agresiva`, `moderada`, `conservadora`)\n"
+        "• `/pnl` - Ganancias netas en USDT (con comisiones descontadas)\n"
+        "• `/posiciones` - Operaciones abiertas y ganancia flotante en vivo\n"
+        "• `/cerrar BTC/USDT` - Cerrar una posición a mercado\n"
+        "• `/autotrade on|off` - Activar o pausar el auto-trading\n"
+        "• `/balance` - Saldo libre en WEEX\n"
+        "• `/estado` - Configuración general y estado del bot\n"
         "• `/precio BTC/USDT` - Precio actual\n"
     )
     await update.effective_message.reply_text(msg, parse_mode="Markdown")
 
+async def cmd_estrategia(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await guard(update): return
+    global ACTIVE_STRATEGY
+    if context.args:
+        eleccion = context.args[0].lower()
+        if eleccion in STRATEGIES:
+            ACTIVE_STRATEGY = eleccion
+            s = STRATEGIES[ACTIVE_STRATEGY]
+            await update.effective_message.reply_text(
+                f"✅ Estrategia cambiada a: *{s['name']}*\n"
+                f"• Take Profit: `+{s['tp_pct']}%`\n"
+                f"• Stop Loss: `-{s['sl_pct']}%`\n"
+                f"• Score Mínimo: `{s['min_score']}/100`\n"
+                f"• {s['desc']}",
+                parse_mode="Markdown"
+            )
+            return
+
+    lines = ["📊 *ESTRATEGIAS DISPONIBLES:*\n"]
+    for k, v in STRATEGIES.items():
+        actual = "👉 *(ACTUAL)* " if k == ACTIVE_STRATEGY else "• "
+        lines.append(f"{actual}*{v['name']}* (`/estrategia {k}`)\n  TP: `+{v['tp_pct']}%` | SL: `-{v['sl_pct']}%` | Score: `≥{v['min_score']}`\n  _{v['desc']}_\n")
+    await update.effective_message.reply_text("\n".join(lines), parse_mode="Markdown")
+
 async def cmd_pnl(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await guard(update): return
-    stats = get_pnl_summary()
+    summary = get_pnl_summary()
     open_pos = get_open_positions()
 
-    floating_pnl = 0.0
+    floating_neto = 0.0
     for p in open_pos:
         try:
             curr = float(exchange.fetch_ticker(p["symbol"])["last"])
-            floating_pnl += (curr - p["entry_price"]) * p["amount_coin"]
+            bruto = (curr - p["entry_price"]) * p["amount_coin"]
+            fee = (p["amount_usdt"] * FEE_PCT) * 2
+            floating_neto += (bruto - fee)
         except Exception:
             pass
 
-    color = "🟢 +" if stats["total_pnl"] >= 0 else "🔴 "
+    color = "🟢 +" if summary["total_neto"] >= 0 else "🔴 "
     msg = (
-        "💰 *REPORTE DE PnL & RENDIMIENTO*\n\n"
-        f"• PnL Realizado Total: *{color}{stats['total_pnl']:.4f} USDT*\n"
-        f"• PnL Flotante en Curso: *{floating_pnl:+.4f} USDT*\n"
-        f"• Operaciones Ganadoras: *{stats['wins']}* 🎯\n"
-        f"• Operaciones Perdedoras: *{stats['losses']}* 🛑\n"
-        f"• Tasa de Acierto (Winrate): *{stats['winrate']:.1f}%*\n"
-        f"• Total Operaciones Cerradas: *{stats['total']}*\n"
-        f"• Operaciones Abiertas Ahora: *{len(open_pos)}*"
-    )
-    await update.effective_message.reply_text(msg, parse_mode="Markdown")
-
-async def cmd_aprendizaje(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await guard(update): return
-    settings = get_adaptive_settings()
-    stats = get_pnl_summary()
-
-    msg = (
-        "🧠 *ESTADO DEL MOTOR DE APRENDIZAJE*\n\n"
-        f"• Estado del Cerebro: *{settings['confidence']}*\n"
-        f"• Filtro Score Mínimo: *≥ {settings['score_threshold']}/100*\n"
-        f"• Take Profit Dinámico: *+{settings['tp_pct']:.1f}%*\n"
-        f"• Stop Loss de Protección: *-{settings['sl_pct']:.1f}%*\n"
-        f"• Base de Experiencia: `{stats['total']} operaciones procesadas`\n"
-        f"• Tasa de Acierto: `{settings['winrate']:.1f}%`\n\n"
-        "_El bot calibra la exigencia de entrada según el PnL y acierto reciente._"
+        "💰 *REPORTE FINANCIERO (PnL NETO REAL)*\n\n"
+        f"• Ganancia Neta Total: *{color}{summary['total_neto']:.4f} USDT*\n"
+        f"• PnL Flotante en Curso: *{floating_neto:+.4f} USDT*\n"
+        f"• Comisiones Totales Pagadas: `-${summary['total_fees']:.4f} USDT`\n"
+        f"• Operaciones Ganadoras: *{summary['wins']}* 🎯\n"
+        f"• Operaciones Perdedoras: *{summary['losses']}* 🛑\n"
+        f"• Tasa de Acierto (Winrate): *{summary['winrate']:.1f}%*\n"
+        f"• Total Operaciones: *{summary['total']}*\n\n"
+        "_Todas las ganancias reportadas son 100% netas con comisiones descontadas._"
     )
     await update.effective_message.reply_text(msg, parse_mode="Markdown")
 
@@ -508,45 +508,36 @@ async def cmd_posiciones(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await guard(update): return
     positions = get_open_positions()
     if not positions:
-        await update.effective_message.reply_text("ℹ️ No hay posiciones abiertas actualmente. El bot sigue escaneando el mercado.")
+        await update.effective_message.reply_text("ℹ️ No hay posiciones abiertas actualmente. Escaneando oportunidades...")
         return
 
-    lines = ["📊 *OPERACIONES EN CURSO (PnL EN VIVO):*\n"]
+    lines = ["📊 *POSICIONES ABIERTAS (PnL NETO EN VIVO):*\n"]
     for p in positions:
         sym = p["symbol"]
         entry = p["entry_price"]
         amount_coin = p["amount_coin"]
+        amount_usdt = p["amount_usdt"]
         tp = p["tp_price"]
         sl = p["sl_price"]
+        strat_name = p.get("strategy_name", ACTIVE_STRATEGY)
         try:
             curr = float(exchange.fetch_ticker(sym)["last"])
-            pnl_pct = ((curr - entry) / entry) * 100
-            pnl_usdt = (curr - entry) * amount_coin
-            badge = "🟢" if pnl_pct >= 0 else "🔴"
+            bruto_pct = ((curr - entry) / entry) * 100
+            fee_usdt = (amount_usdt * FEE_PCT) * 2
+            neto_usdt = ((curr - entry) * amount_coin) - fee_usdt
+            neto_pct = bruto_pct - (FEE_PCT * 200)
+
+            badge = "🟢" if neto_pct >= 0 else "🔴"
             lines.append(
-                f"{badge} *{sym}*\n"
+                f"{badge} *{sym}* ({strat_name.capitalize()})\n"
                 f"• Entrada: `${entry:g}` ➡️ Actual: `${curr:g}`\n"
-                f"• PnL Flotante: *{pnl_pct:+.2f}%* ({pnl_usdt:+.4f} USDT)\n"
+                f"• PnL Neto: *{neto_pct:+.2f}%* ({neto_usdt:+.4f} USDT)\n"
                 f"• TP: `${tp:.4f}` | SL: `${sl:.4f}`\n"
             )
         except Exception:
             lines.append(f"• *{sym}*: Entrada `${entry:g}`")
 
     await update.effective_message.reply_text("\n".join(lines), parse_mode="Markdown")
-
-async def cmd_autotrade(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await guard(update): return
-    global AUTOTRADE_ENABLED
-    arg = context.args[0].lower() if context.args else ""
-    if arg == "on":
-        AUTOTRADE_ENABLED = True
-        await update.effective_message.reply_text("✅ *Trading Autónomo ACTIVADO*.\nBuscando oportunidades en tiempo real.", parse_mode="Markdown")
-    elif arg == "off":
-        AUTOTRADE_ENABLED = False
-        await update.effective_message.reply_text("⏸️ *Trading Autónomo PAUSADO*.\nNo abrirá nuevas posiciones.", parse_mode="Markdown")
-    else:
-        status = "ACTIVADO ✅" if AUTOTRADE_ENABLED else "PAUSADO ⏸️"
-        await update.effective_message.reply_text(f"Estado del Auto-Trading: *{status}*\nUsa `/autotrade on` o `/autotrade off`", parse_mode="Markdown")
 
 async def cmd_cerrar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await guard(update): return
@@ -563,22 +554,40 @@ async def cmd_cerrar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     pos = positions[0]
     amount_coin = pos["amount_coin"]
     entry_price = pos["entry_price"]
+    amount_usdt = pos["amount_usdt"]
 
     try:
         curr = float(exchange.fetch_ticker(sym)["last"])
-        pnl_pct = ((curr - entry_price) / entry_price) * 100
-        pnl_usdt = (curr - entry_price) * amount_coin
-        order_res = execute_order(sym, "sell", amount_coin, "Cierre manual por usuario")
-        record_closed_trade(pos, curr, pnl_usdt, pnl_pct, "CIERRE_MANUAL")
+        pnl_bruto = (curr - entry_price) * amount_coin
+        comision = (amount_usdt * FEE_PCT) * 2
+        pnl_neto = pnl_bruto - comision
+        pnl_neto_pct = ((curr - entry_price) / entry_price * 100) - (FEE_PCT * 200)
+
+        order_res = execute_order(sym, "sell", amount_coin, "Cierre manual")
+        record_closed_trade(pos, curr, pnl_bruto, comision, pnl_neto, pnl_neto_pct, "CIERRE_MANUAL")
 
         await update.effective_message.reply_text(
             f"✅ Posición {sym} cerrada a mercado.\n"
-            f"Salida: `${curr:g}` | PnL: *{pnl_pct:+.2f}%* ({pnl_usdt:+.4f} USDT)\n"
+            f"Salida: `${curr:g}` | PnL Neto: *{pnl_neto_pct:+.2f}%* ({pnl_neto:+.4f} USDT)\n"
             f"Modo: {'🔴 Real' if order_res.get('is_live') else '🧪 Simulación'}",
             parse_mode="Markdown"
         )
     except Exception as e:
         await update.effective_message.reply_text(f"Error al cerrar posición {sym}: {e}")
+
+async def cmd_autotrade(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await guard(update): return
+    global AUTOTRADE_ENABLED
+    arg = context.args[0].lower() if context.args else ""
+    if arg == "on":
+        AUTOTRADE_ENABLED = True
+        await update.effective_message.reply_text("✅ *Auto-Trading ACTIVADO*.", parse_mode="Markdown")
+    elif arg == "off":
+        AUTOTRADE_ENABLED = False
+        await update.effective_message.reply_text("⏸️ *Auto-Trading PAUSADO*.", parse_mode="Markdown")
+    else:
+        status = "ACTIVADO ✅" if AUTOTRADE_ENABLED else "PAUSADO ⏸️"
+        await update.effective_message.reply_text(f"Estado del Auto-Trading: *{status}*\nUsa `/autotrade on` o `/autotrade off`", parse_mode="Markdown")
 
 async def cmd_balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await guard(update): return
@@ -596,17 +605,18 @@ async def cmd_estado(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await guard(update): return
     open_count = len(get_open_positions())
     is_live = (not DRY_RUN) and ALLOW_LIVE
-    settings = get_adaptive_settings()
+    s = STRATEGIES[ACTIVE_STRATEGY]
     await update.effective_message.reply_text(
-        f"⚙️ *ESTADO DEL BOT WEEX*\n\n"
+        f"⚙️ *ESTADO DEL MASTER BOT*\n\n"
+        f"• Estrategia Activa: *{s['name']}*\n"
+        f"• Take Profit: `+{s['tp_pct']}%` | Stop Loss: `-{s['sl_pct']}%`\n"
         f"• Auto-Trading: *{'ACTIVADO ✅' if AUTOTRADE_ENABLED else 'PAUSADO ⏸️'}*\n"
         f"• Modo Órdenes: *{'🔴 DINERO REAL' if is_live else '🧪 SIMULACIÓN (DRY_RUN)'}*\n"
         f"• Posiciones abiertas: *{open_count}/{MAX_OPEN_POSITIONS}*\n"
         f"• Monto por trade: *{AMOUNT_USDT} USDT*\n"
-        f"• Filtro adaptado actual: *Score ≥ {settings['score_threshold']}/100*\n"
-        f"• Take Profit: *+{settings['tp_pct']:.1f}%* | Stop Loss: *-{settings['sl_pct']:.1f}%*\n"
+        f"• Comisión estimada considerada: `{(FEE_PCT*100):.2f}% por lado`\n"
         f"• Watchlist: `{', '.join(WATCHLIST)}`\n"
-        f"• Intervalo de escaneo: `{INTERVAL} segundos`",
+        f"• Temporalidades: Macro `{TIMEFRAME_MACRO}` + Micro `{TIMEFRAME_MICRO}`",
         parse_mode="Markdown"
     )
 
@@ -623,36 +633,17 @@ async def cmd_precio(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as exc:
         await update.effective_message.reply_text(f"No pude obtener {sym}: {exc}")
 
-async def cmd_ranking(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await guard(update): return
-    await update.effective_message.reply_text("⏳ Escaneando mercados USDT; analizando indicadores...")
-    results = []
-    for sym in WATCHLIST:
-        try:
-            results.append(analyze_symbol(sym))
-        except Exception:
-            continue
-    results.sort(key=lambda x: x["score"], reverse=True)
-    if not results:
-        await update.effective_message.reply_text("No se pudieron analizar mercados.")
-        return
-    msg = "🏆 *RANKING TÉCNICO WEEX*\n\n" + "\n\n".join(
-        f"{i}. *{x['symbol']}*: ${x['price']:g} | Score: *{x['score']}* ({x['signal']})\nRSI: {x['rsi']:.1f} | Vol: {x['volume_ratio']:.2f}x"
-        for i, x in enumerate(results, 1)
-    )
-    await update.effective_message.reply_text(msg, parse_mode="Markdown")
-
 # ==================== INICIO PRINCIPAL ====================
 def main():
     global exchange
     if not TOKEN:
-        raise SystemExit("Falta TELEGRAM_BOT_TOKEN en las variables de entorno.")
+        raise SystemExit("Falta TELEGRAM_BOT_TOKEN.")
 
     init_db()
     exchange = get_exchange()
     try:
         exchange.load_markets()
-        log.info("WEEX conectado. %s mercados disponibles.", len(exchange.markets))
+        log.info("WEEX conectado. %s mercados listos.", len(exchange.markets))
     except Exception as e:
         log.error("Aviso al cargar mercados: %s", e)
 
@@ -661,21 +652,19 @@ def main():
     for name, callback in [
         ("start", cmd_start),
         ("help", cmd_start),
+        ("estrategia", cmd_estrategia),
         ("pnl", cmd_pnl),
-        ("aprendizaje", cmd_aprendizaje),
         ("posiciones", cmd_posiciones),
-        ("autotrade", cmd_autotrade),
         ("cerrar", cmd_cerrar),
-        ("estado", cmd_estado),
+        ("autotrade", cmd_autotrade),
         ("balance", cmd_balance),
+        ("estado", cmd_estado),
         ("precio", cmd_precio),
-        ("ranking", cmd_ranking),
     ]:
         app.add_handler(CommandHandler(name, callback))
 
-    # Tarea de Trading Continuo cada 45 segundos
-    app.job_queue.run_repeating(autonomous_engine, interval=INTERVAL, first=10)
-    log.info("Motor de trading autónomo y continuo activo cada %s segundos.", INTERVAL)
+    app.job_queue.run_repeating(master_trading_engine, interval=INTERVAL, first=10)
+    log.info("Motor Master activo cada %s segundos.", INTERVAL)
 
     start_keep_alive()
     app.run_polling()
