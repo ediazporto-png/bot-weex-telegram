@@ -14,6 +14,7 @@ from dotenv import load_dotenv
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 from learning_center import LearningCenter
+from keep_alive import start_keep_alive
 import asyncio
 
 load_dotenv()
@@ -412,6 +413,7 @@ def main():
     app.job_queue.run_repeating(market_job, interval=INTERVAL, first=15)
     app.job_queue.run_repeating(learning_job, interval=INTERVAL, first=30)
     log.info("Bot de Telegram iniciado.")
+    start_keep_alive()  # servidor HTTP en $PORT + auto-ping anti spin-down
     app.run_polling()
 
 
